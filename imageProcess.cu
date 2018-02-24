@@ -10,10 +10,10 @@
 #define	BGR	3
 #define	BGRA	4
 
-uchar4* getData(IplImage* image) {
+__host__ uchar4* getData(IplImage* image) {
     long index, i, j;
     char *str;
-    uchar4* data = new uchar4[image->height * image->width];
+    uchar4* data = (uchar4*)malloc(sizeof(uchar4) * image->height * image->width);
 
     for (i = 0; i < image->height; ++i) {
 	str = image->imageData + i * image->widthStep;
@@ -30,7 +30,7 @@ uchar4* getData(IplImage* image) {
 }
 
 
-void toGrayScale(uchar4* data, IplImage* outImage) {
+__host__ void toGrayScale(uchar4* data, IplImage* outImage) {
     long index, i, j;
     char *ptr;
     for (i = 0; i < outImage->height; ++i) {
@@ -42,8 +42,8 @@ void toGrayScale(uchar4* data, IplImage* outImage) {
     }
 }
 
-double* generateGausianBlur(double sigma, int N) {
-    double* result = (double*)malloc(sizeof(double) * N);
+__host__ double* generateGausianBlur(double sigma, int N) {
+    double* result = (double*)malloc(sizeof(double) * N * N);
     double mean = N / 2, sum = 0;
     long i, j, index;
     for (i = 0; i < N; ++i) {
@@ -59,8 +59,47 @@ double* generateGausianBlur(double sigma, int N) {
     return result;
 }
 
+__global__ void grayCuda(uchar4 *d_in, char *d_out, int d_width, int d_height){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
 
-uchar4 getValueBlur(uchar4* data, IplImage* outImage, int x, int y, const double* const filter, const int filterWidth) {
+    if (j < d_height && i < d_width) {
+	int index = j * d_width + i;
+	d_out[index] = (char)(.299f * d_in[index].z + .587f * d_in[index].y + .114f * d_in[index].x);
+    }
+}
+
+
+__host__ int cudaGrayScale(cudaDeviceProp deviceProp, IplImage* image, IplImage* outImage, const uchar4* const h_in) {
+    int thread = (int)sqrt(deviceProp.maxThreadsPerBlock);
+
+    uchar4 *d_in;
+    char *d_out;
+    size_t ARRAY_INPUT_BYTE = image->height * image->width * sizeof(uchar4);
+    size_t ARRAY_OUT_BYTE = image->height * image->width * sizeof(char);
+
+    cudaMalloc((void**) &d_in, ARRAY_INPUT_BYTE);
+    cudaMalloc((void**) &d_out, ARRAY_OUT_BYTE);
+    cudaMemcpy(d_in, h_in, ARRAY_INPUT_BYTE, cudaMemcpyHostToDevice);
+
+    dim3 blockSize(thread, thread);
+    dim3 gridSize(ceil((float)image->width / thread), ceil((float)image->height / thread));
+    grayCuda<<<gridSize, blockSize>>>(d_in, d_out, image->width, image->height);
+    cudaDeviceSynchronize();
+
+    int i;
+    char* ptr = outImage->imageData, *src = d_out;
+    for (i = 0; i < image->height; ++i) {
+	cudaMemcpy(ptr, src, image->width, cudaMemcpyDeviceToHost);
+	ptr += outImage->widthStep;
+	src += image->width;
+    }
+    cudaFree(d_in);
+    cudaFree(d_out);
+    return 0;
+}
+
+__host__ uchar4 getValueBlur(uchar4* data, IplImage* outImage, int x, int y, const double* const filter, const int filterWidth) {
     long index, i, j, fltIndex = 0;
     uchar4 value = { 0, 0, 0 };
     double filterValue;
@@ -81,7 +120,7 @@ uchar4 getValueBlur(uchar4* data, IplImage* outImage, int x, int y, const double
     return value;
 }
 
-void blurImage(uchar4* data, IplImage* outImage, const double* const filter, const int filterWidth) {
+__host__ void blurImage(uchar4* data, IplImage* outImage, const double* const filter, const int filterWidth) {
     long i, j;
     char *ptr;
     uchar4 value;
@@ -98,59 +137,85 @@ void blurImage(uchar4* data, IplImage* outImage, const double* const filter, con
     }
 }
 
+__global__
+void separateChannels(const uchar4* const inputImageRGBA,
+				int numRows, int numCols,
 
-__global__ void grayCuda(uchar4 *d_in, char *d_out, int d_width, int d_height){
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    if (j < d_height && i < d_width) {
-	int index = j * d_width + i;
-	d_out[index] = (char)(.299f * d_in[index].z + .587f * d_in[index].y + .114f * d_in[index].x);
-    }
+				unsigned char* const redChannel,
+
+				unsigned char* const  greenChannel,
+
+				unsigned char* const  blueChannel)
+ {
+
+    long x, y, index;
+    x = blockIdx.x * blockDim.x + threadIdx.x;
+    y = blockIdx.y * blockDim.y + threadIdx.y;
+    index = y * numCols + x;
+
+    if (x >= numCols || y >= numRows)
+	return;
+
+    redChannel[index] = inputImageRGBA[index].z;
+    greenChannel[index] = inputImageRGBA[index].y;
+    blueChannel[index] = inputImageRGBA[index].x;
 }
 
-int cudaGrayScale(cudaDeviceProp deviceProp, IplImage* image, IplImage* outImage, uchar4* h_in) {
-        int thread = (int)sqrt(deviceProp.maxThreadsPerBlock);
+__host__ int cudaBlur(cudaDeviceProp deviceProp, IplImage* outImage, uchar4* h_in) {
+    size_t SIZE = outImage->width * outImage->height;
+    size_t IN_BYTE = sizeof(uchar4) * SIZE;
+    size_t CHANNEL_BYTE = sizeof(unsigned char) * SIZE;
 
-	//Find thread count on block
-        while (thread > deviceProp.maxThreadsDim[0] || thread > deviceProp.maxThreadsDim[1])
-	    --thread;
-	if (thread <= 0) {
-	    printf("Don't find block size\n");
-	    return -1;
+    int thread = (int)sqrt(deviceProp.maxThreadsPerBlock);
+    dim3 blockSize(thread, thread);
+    dim3 gridSize(ceil((float)outImage->width / thread), ceil((float)outImage->height / thread));
+
+    uchar4 *d_in;
+    unsigned char *d_red, *d_green, *d_blue;
+    unsigned char *h_red, *h_green, *h_blue;
+
+    h_red = (unsigned char*)malloc(sizeof(unsigned char) * SIZE);
+    h_green = (unsigned char*)malloc(sizeof(unsigned char) * SIZE);
+    h_blue = (unsigned char*)malloc(sizeof(unsigned char) * SIZE);
+
+    cudaMalloc((void**)&d_in, IN_BYTE);
+    cudaMalloc((void**)&d_red, CHANNEL_BYTE);
+    cudaMalloc((void**)&d_green, CHANNEL_BYTE);
+    cudaMalloc((void**)&d_blue, CHANNEL_BYTE);
+
+    cudaMemcpy(d_in, h_in, IN_BYTE, cudaMemcpyHostToDevice);
+    separateChannels<<<gridSize, blockSize>>>(d_in, outImage->height, outImage->width,
+ d_red,
+ d_green,
+ d_blue);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_red, d_red, CHANNEL_BYTE, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_green, d_green, CHANNEL_BYTE, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_blue, d_blue, CHANNEL_BYTE, cudaMemcpyDeviceToHost);
+
+    int i, j, index;
+    char *ptr;
+    for (i = 0; i < outImage->height; ++i) {
+	ptr = outImage->imageData + i * outImage->widthStep;
+	for (j = 0; j < outImage->width; ++j) {
+	    index = i * outImage->width + j;
+	    ptr[j] = h_blue[index];	//B
+	    ptr[j + 1] = h_green[index];//G
+	    ptr[j + 2] = h_red[index];	//R
+            ptr += 3;
 	}
+    }
 
-	//Find grid size
-	while (image->width / thread > deviceProp.maxGridSize[0] ||  image->height / thread > deviceProp.maxGridSize[1])
-	    --thread;
-	if (thread <= 0) {
-	    printf("Don't find dim size\n");
-	    return -1;
-	}
+    cudaFree(d_in);
+    cudaFree(d_red);
+    cudaFree(d_green);
+    cudaFree(d_blue);
 
-	uchar4 *d_in;
-	char *d_out;
-	size_t ARRAY_INPUT_BYTE = image->height * image->width * sizeof(uchar4);
-	size_t ARRAY_OUT_BYTE = image->height * image->width * sizeof(char);
-
-	cudaMalloc((void**) &d_in, ARRAY_INPUT_BYTE);
-	cudaMalloc((void**) &d_out, ARRAY_OUT_BYTE);
-	cudaMemcpy(d_in, h_in, ARRAY_INPUT_BYTE, cudaMemcpyHostToDevice);
-
-
-	dim3 threadsPerBlock(thread, thread);
-	dim3 numBlocks(ceil((float)image->width / thread), ceil((float)image->height / thread));
-	grayCuda<<<numBlocks, threadsPerBlock>>>(d_in, d_out, image->width, image->height);
-
-	int i;
-	char* ptr = outImage->imageData, *src = d_out;
-	for (i = 0; i < image->height; ++i) {
-	    cudaMemcpy(ptr, src, image->width, cudaMemcpyDeviceToHost);
-	    ptr += outImage->widthStep;
-	    src += image->width;
-	}
-    	cudaFree(d_in);
-    	cudaFree(d_out);
-	return 0;
+    free(h_red);
+    free(h_green);
+    free(h_blue);
+    return 0;
 }
 
 int main( int argc, char **argv) {
@@ -193,24 +258,27 @@ int main( int argc, char **argv) {
 
     if (strcmp(argv[1], "gray") == 0) {
 	outImage = cvCreateImage(CvSize(image->width, image->height), IPL_DEPTH_8U, 1);
-    	if (CUDA && cudaGrayScale(deviceProp, image, outImage, h_in) != 0)
-	    return -1;
-    	else
+    	if (CUDA) {
+	    if (cudaGrayScale(deviceProp, image, outImage, h_in) != 0)
+		return -1;
+	}
+    	else {
 	    toGrayScale(h_in, outImage);
+	}
     }
     else if (strcmp(argv[1], "blur") == 0) {
+	const int filterWidth = 3;
+        double* filter = generateGausianBlur(0.5, filterWidth);
+
 	outImage = cvCreateImage(CvSize(image->width, image->height), IPL_DEPTH_8U, 4);
 
-	const int filterWidth = 3;
-        double* filter = generateGausianBlur(1, filterWidth);
-	blurImage(h_in, outImage, filter, filterWidth);	
-
-	for (int i = 0; i < filterWidth; ++i) {
-	    for (int j = 0; j < filterWidth; ++j)
-		printf("%f ", filter[i * filterWidth + j]);
-	    printf("\n");
+	if (CUDA) {
+	    if (cudaBlur(deviceProp, outImage, h_in) != 0)
+		return -1;
 	}
-
+	else {
+	    blurImage(h_in, outImage, filter, filterWidth);
+	}
 	free(filter);
     }
 
@@ -218,7 +286,7 @@ int main( int argc, char **argv) {
 
     cvSaveImage(argv[3], outImage);
 
-    delete(h_in);
+    free(h_in);
     cvReleaseImage(&image);
     cvReleaseImage(&outImage);
 
