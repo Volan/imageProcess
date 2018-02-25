@@ -138,6 +138,35 @@ __host__ void blurImage(uchar4* data, IplImage* outImage, const double* const fi
 }
 
 __global__
+void gaussian_blur(const unsigned char* const inChannel,
+			unsigned char* outChannel,
+			int numRows, int numCols,
+
+			const double* const filter, const int filterWidth) 
+{
+    long x, y, i, j, fltIndex, stencilIndex, index;
+
+    x = blockIdx.x * blockDim.x + threadIdx.x;
+    y = blockIdx.y * blockDim.y + threadIdx.y;
+    index = y * numCols + x;
+
+    if (x >= numCols || y >= numRows)
+	return;
+
+    outChannel[index] = fltIndex = 0;
+    for (i = x - filterWidth / 2; i <= x + filterWidth / 2; ++i) {
+	for (j = y - filterWidth / 2; j <= y + filterWidth / 2; ++j) {
+	    if (x < 0 || x >= numCols || y < 0 || y >= numRows)
+		continue;
+	    stencilIndex = j * numCols + x;
+	    outChannel[index] += inChannel[stencilIndex] * filter[fltIndex++];
+	}
+    }
+}
+
+
+
+__global__
 void separateChannels(const uchar4* const inputImageRGBA,
 				int numRows, int numCols,
 
@@ -161,18 +190,20 @@ void separateChannels(const uchar4* const inputImageRGBA,
     blueChannel[index] = inputImageRGBA[index].x;
 }
 
-__host__ int cudaBlur(cudaDeviceProp deviceProp, IplImage* outImage, uchar4* h_in) {
+__host__ int cudaBlur(cudaDeviceProp deviceProp, IplImage* outImage, const uchar4* const h_in, const int filterWidth, const double* const h_filter) {
     size_t SIZE = outImage->width * outImage->height;
     size_t IN_BYTE = sizeof(uchar4) * SIZE;
     size_t CHANNEL_BYTE = sizeof(unsigned char) * SIZE;
+    size_t FILTER_BYTE = sizeof(double) * filterWidth * filterWidth;
 
     int thread = (int)sqrt(deviceProp.maxThreadsPerBlock);
     dim3 blockSize(thread, thread);
     dim3 gridSize(ceil((float)outImage->width / thread), ceil((float)outImage->height / thread));
 
     uchar4 *d_in;
-    unsigned char *d_red, *d_green, *d_blue;
+    unsigned char *d_red, *d_green, *d_blue, *d_red_out, *d_green_out, *d_blue_out;
     unsigned char *h_red, *h_green, *h_blue;
+    double *d_filter;
 
     h_red = (unsigned char*)malloc(sizeof(unsigned char) * SIZE);
     h_green = (unsigned char*)malloc(sizeof(unsigned char) * SIZE);
@@ -182,17 +213,37 @@ __host__ int cudaBlur(cudaDeviceProp deviceProp, IplImage* outImage, uchar4* h_i
     cudaMalloc((void**)&d_red, CHANNEL_BYTE);
     cudaMalloc((void**)&d_green, CHANNEL_BYTE);
     cudaMalloc((void**)&d_blue, CHANNEL_BYTE);
+    cudaMalloc((void**)&d_red_out, CHANNEL_BYTE);
+    cudaMalloc((void**)&d_green_out, CHANNEL_BYTE);
+    cudaMalloc((void**)&d_blue_out, CHANNEL_BYTE);
+    cudaMalloc((void**)&d_filter, FILTER_BYTE);
 
     cudaMemcpy(d_in, h_in, IN_BYTE, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_filter, h_filter, FILTER_BYTE, cudaMemcpyHostToDevice);
+
     separateChannels<<<gridSize, blockSize>>>(d_in, outImage->height, outImage->width,
  d_red,
  d_green,
  d_blue);
     cudaDeviceSynchronize();
 
-    cudaMemcpy(h_red, d_red, CHANNEL_BYTE, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_green, d_green, CHANNEL_BYTE, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_blue, d_blue, CHANNEL_BYTE, cudaMemcpyDeviceToHost);
+    cudaMemcpy(d_red_out, d_red, CHANNEL_BYTE, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_green_out, d_green, CHANNEL_BYTE, cudaMemcpyDeviceToDevice);
+    cudaMemcpy(d_blue_out, d_blue, CHANNEL_BYTE, cudaMemcpyDeviceToDevice);
+
+    gaussian_blur<<<gridSize, blockSize>>>(d_red, d_red_out, outImage->height, outImage->width,
+ d_filter, filterWidth);
+    cudaDeviceSynchronize();
+    gaussian_blur<<<gridSize, blockSize>>>(d_green, d_green_out, outImage->height, outImage->width,
+ d_filter, filterWidth);
+    cudaDeviceSynchronize();
+    gaussian_blur<<<gridSize, blockSize>>>(d_blue, d_blue_out, outImage->height, outImage->width,
+ d_filter, filterWidth);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_red, d_red_out, CHANNEL_BYTE, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_green, d_green_out, CHANNEL_BYTE, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_blue, d_blue_out, CHANNEL_BYTE, cudaMemcpyDeviceToHost);
 
     int i, j, index;
     char *ptr;
@@ -211,6 +262,10 @@ __host__ int cudaBlur(cudaDeviceProp deviceProp, IplImage* outImage, uchar4* h_i
     cudaFree(d_red);
     cudaFree(d_green);
     cudaFree(d_blue);
+    cudaFree(d_red_out);
+    cudaFree(d_green_out);
+    cudaFree(d_blue_out);
+    cudaFree(d_filter);
 
     free(h_red);
     free(h_green);
@@ -268,12 +323,12 @@ int main( int argc, char **argv) {
     }
     else if (strcmp(argv[1], "blur") == 0) {
 	const int filterWidth = 3;
-        double* filter = generateGausianBlur(0.5, filterWidth);
+        double* filter = generateGausianBlur(1, filterWidth);
 
 	outImage = cvCreateImage(CvSize(image->width, image->height), IPL_DEPTH_8U, 4);
 
 	if (CUDA) {
-	    if (cudaBlur(deviceProp, outImage, h_in) != 0)
+	    if (cudaBlur(deviceProp, outImage, h_in, filterWidth, filter) != 0)
 		return -1;
 	}
 	else {
